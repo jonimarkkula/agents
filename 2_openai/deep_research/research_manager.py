@@ -1,84 +1,67 @@
-from agents import Runner, trace, gen_trace_id
+from agents import Agent, Handoff
+from dotenv import load_dotenv
+from openai import OpenAI
+from planner_agent import planner_agent
 from search_agent import search_agent
-from planner_agent import planner_agent, WebSearchItem, WebSearchPlan
-from writer_agent import writer_agent, ReportData
+from writer_agent import writer_agent
 from email_agent import email_agent
-import asyncio
 
-class ResearchManager:
+load_dotenv(override=True)
 
-    async def run(self, query: str):
-        """ Run the deep research process, yielding the status updates and the final report"""
-        trace_id = gen_trace_id()
-        with trace("Research trace", trace_id=trace_id):
-            print(f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}")
-            yield f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}"
-            print("Starting research...")
-            search_plan = await self.plan_searches(query)
-            yield "Searches planned, starting to search..."     
-            search_results = await self.perform_searches(search_plan)
-            yield "Searches complete, writing report..."
-            report = await self.write_report(query, search_results)
-            yield "Report written, sending email..."
-            await self.send_email(report)
-            yield "Email sent, research complete"
-            yield report.markdown_report
-        
+client = OpenAI()
 
-    async def plan_searches(self, query: str) -> WebSearchPlan:
-        """ Plan the searches to perform for the query """
-        print("Planning searches...")
-        result = await Runner.run(
-            planner_agent,
-            f"Query: {query}",
-        )
-        print(f"Will perform {len(result.final_output.searches)} searches")
-        return result.final_output_as(WebSearchPlan)
+planner_tool = planner_agent.as_tool(
+    tool_name="planner_agent",
+    tool_description="Plan which searches to perform for a research query."
+)
 
-    async def perform_searches(self, search_plan: WebSearchPlan) -> list[str]:
-        """ Perform the searches to perform for the query """
-        print("Searching...")
-        num_completed = 0
-        tasks = [asyncio.create_task(self.search(item)) for item in search_plan.searches]
-        results = []
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            if result is not None:
-                results.append(result)
-            num_completed += 1
-            print(f"Searching... {num_completed}/{len(tasks)} completed")
-        print("Finished searching")
-        return results
+search_tool = search_agent.as_tool(
+    tool_name="search_agent",
+    tool_description="Perform searches for the items in the plan."
+)
 
-    async def search(self, item: WebSearchItem) -> str | None:
-        """ Perform a search for the query """
-        input = f"Search term: {item.query}\nReason for searching: {item.reason}"
-        try:
-            result = await Runner.run(
-                search_agent,
-                input,
-            )
-            return str(result.final_output)
-        except Exception:
-            return None
+writer_tool = writer_agent.as_tool(
+    tool_name="writer_agent",
+    tool_description="Write the research report from search results."
+)
 
-    async def write_report(self, query: str, search_results: list[str]) -> ReportData:
-        """ Write the report for the query """
-        print("Thinking about report...")
-        input = f"Original query: {query}\nSummarized search results: {search_results}"
-        result = await Runner.run(
-            writer_agent,
-            input,
-        )
+email_tool = email_agent.as_tool(
+    tool_name="email_agent",
+    tool_description="Send the final report to the user."
+)
 
-        print("Finished writing report")
-        return result.final_output_as(ReportData)
-    
-    async def send_email(self, report: ReportData) -> None:
-        print("Writing email...")
-        result = await Runner.run(
-            email_agent,
-            report.markdown_report,
-        )
-        print("Email sent")
-        return report
+research_agent = Agent(
+    name="Research Orchestrator",
+    instructions="""
+You are the Research Manager. Your job is to coordinate planning, searching, report writing, 
+and emailing using the appropriate sub-agents.
+You only output final results unless you are calling a tool.
+
+Follow this workflow:
+
+1. Receive the user's research query.
+
+2. Call the planner_agent tool to generate a WebSearchPlan.
+   - The plan must include a set of search items and the reason for each.
+
+3. After receiving the plan, call the search_agent tool once for each search item.
+   - Aggregate and summarize all search results.
+
+4. After all searches are completed, call the writer_agent tool to produce a polished,
+   markdown-formatted research report that includes:
+   - The original query
+   - A synthesis of all search results
+   - Clear structure and professionalism
+
+5. After the report is created, call the email_agent tool to send the report to the user.
+
+6. Your **final output** (after all tool calls are complete) must be only the full
+   markdown report generated by writer_agent.
+
+Rules:
+- Do not perform planning, searching, writing, or emailing yourself.
+- Delegate every step to its proper tool.
+- Only produce messages when required for a tool call or final output.
+""",
+    tools=[planner_tool, search_tool, writer_tool, email_tool]
+)
